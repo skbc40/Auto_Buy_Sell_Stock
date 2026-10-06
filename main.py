@@ -10,8 +10,9 @@ import yaml
 from kiwoom.core.runtime import get_client, get_ws_client
 from kiwoom.realtime.packets import build_reg_packet, build_remove_packet
 
+import tg
 from broker import KiwoomBroker, norm_code, to_float, to_int
-from trader import Trader, hm
+from trader import NOTIFY, Trader, hm
 
 WS_PATH = "/api/dostk/websocket"
 CHUNK = 50  # 실시간 등록 1회 패킷당 종목 수
@@ -98,7 +99,7 @@ async def run(cfg: dict, halt=None, state: dict | None = None) -> None:
     state.update(trader=trader, broker=broker, mode=mode, connected=False, subscribed=0)
     log.info("시작: %s / 예수금 %s원 / 시작 시 보유 종목(건드리지 않음): %s",
              MODES[mode], f"{state.setdefault('cash', broker.cash()):,}",
-             sorted(trader.excluded) or "없음")
+             sorted(trader.excluded) or "없음", extra=NOTIFY)
 
     ws = get_ws_client(mode=mode)
     stop = hm(cfg["session"]["stop"])
@@ -140,7 +141,7 @@ async def run(cfg: dict, halt=None, state: dict | None = None) -> None:
                 await asyncio.sleep(0.2)
             if reader.done():
                 reader.result()  # 읽기 중 예외가 있었다면 여기서 올라온다
-                log.warning("웹소켓 연결이 끊김")
+                log.warning("웹소켓 연결이 끊김", extra=NOTIFY)
         except Exception as e:
             log.error("웹소켓 오류: %s", e)
         finally:
@@ -155,8 +156,9 @@ async def run(cfg: dict, halt=None, state: dict | None = None) -> None:
             log.info("3초 후 재연결")
             await asyncio.sleep(3)
     trader.on_clock(datetime.now())
-    log.info("종료: 남은 포지션 %s / 예수금 %s원",
-             {trader._label(c): p.qty for c, p in trader.pos.items()} or "없음", f"{broker.cash():,}")
+    pnl = sum(t[7] for t in trader.trades if t[7] != "")
+    log.info("종료: 체결 %s건 / 실현손익 %s원(수수료 제외) / 남은 포지션 %s / 예수금 %s원", len(trader.trades), f"{pnl:+,}",
+             {trader._label(c): p.qty for c, p in trader.pos.items()} or "없음", f"{broker.cash():,}", extra=NOTIFY)
 
 
 def wait_for_session(cfg: dict, halt=None) -> bool:
@@ -170,7 +172,7 @@ def wait_for_session(cfg: dict, halt=None) -> bool:
     # ponytail: 공휴일은 모름 — 휴장일엔 틱 없이 돌다가 종료된다
     target = datetime.combine(day, hm(cfg["session"]["start"])) - timedelta(minutes=5)
     msg = f"장 시간이 아닙니다. {target:%m/%d(%a) %H:%M} 까지 기다렸다가 시작합니다."
-    log.info(msg)
+    log.info(msg, extra=NOTIFY)
     if sys.stdout:
         print(msg, flush=True)
     wait = (target - now).total_seconds()
@@ -185,5 +187,7 @@ if __name__ == "__main__":
         config = yaml.safe_load(f)
     if config.get("mode") == "real" and input("실제투자 모드입니다. 실제 돈으로 주문합니다. 진행하려면 '실제투자' 입력: ").strip() != "실제투자":
         sys.exit("취소했습니다.")
+    if config.get("telegram", {}).get("enabled") and (cred := tg.load_credentials()):
+        logging.getLogger().addHandler(tg.NotifyHandler(tg.Telegram(*cred)))  # 알림만 (명령은 GUI 에서)
     wait_for_session(config)
     asyncio.run(run(config))

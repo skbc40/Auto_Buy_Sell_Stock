@@ -11,6 +11,7 @@ log = logging.getLogger("trader")
 MIN = timedelta(minutes=1)
 GRACE = timedelta(seconds=1)   # 분이 바뀐 뒤 늦게 오는 틱을 기다리는 여유
 RETRY = timedelta(seconds=5)   # 주문 실패 시 재시도 간격
+NOTIFY = {"notify": True}      # log.info(..., extra=NOTIFY) 는 텔레그램으로도 보낸다
 
 
 def hm(s: str) -> time:
@@ -203,7 +204,7 @@ class Trader:
                 if close < target:
                     self._close(p, f"5분 판정 미달 (종가 {close:,} < 목표 {target:,.0f})", now)
                 else:
-                    log.info("[%s] 5분 판정 통과 (종가 %s ≥ 목표 %s)", self._label(p.code), f"{close:,}", f"{target:,.0f}")
+                    log.info("[%s] 5분 판정 통과 (종가 %s ≥ 목표 %s)", self._label(p.code), f"{close:,}", f"{target:,.0f}", extra=NOTIFY)
             if now >= p.ready + self.exit_after:
                 self._close(p, "기준봉 15분 시간청산", now)
             self._flush(p, now)
@@ -242,7 +243,7 @@ class Trader:
         if o is None:
             return
         left = o.qty - o.filled
-        log.warning("[%s] %s: %s %s주 (%s)", self._label(o.code), what, o.side, left, o.reason)
+        log.warning("[%s] %s: %s %s주 (%s)", self._label(o.code), what, o.side, left, o.reason, extra=NOTIFY)
         p = self.pos.get(o.code)
         if p is None:
             return
@@ -288,7 +289,7 @@ class Trader:
         self.entered.add(code)
         self.pos[code] = Position(code, self.names.get(code, ""), bar.close, bar.start + MIN)
         log.info("[%s] 기준봉 포착: %s → %s 매수 예정", self._label(code), detail,
-                 f"{bar.start + MIN + self.buy_delay:%H:%M:%S}")
+                 f"{bar.start + MIN + self.buy_delay:%H:%M:%S}", extra=NOTIFY)
 
     def _amount(self) -> int:
         cash = self.broker.cash()
@@ -305,7 +306,7 @@ class Trader:
             amount = self._amount()
             qty = amount // price if price else 0
             if qty < 1:
-                log.warning("[%s] 매수 건너뜀: 금액 %s원으로 1주(%s원)도 못 삼", self._label(p.code), f"{amount:,}", f"{price:,}")
+                log.warning("[%s] 매수 건너뜀: 금액 %s원으로 1주(%s원)도 못 삼", self._label(p.code), f"{amount:,}", f"{price:,}", extra=NOTIFY)
                 del self.pos[p.code]
                 return
             ord_no = self.broker.buy(p.code, qty, price)
@@ -321,7 +322,7 @@ class Trader:
     def _close(self, p: Position, reason: str, now: datetime) -> None:
         if p.close_reason is None:
             p.close_reason = reason
-            log.info("[%s] 전량 매도 결정: %s", self._label(p.code), reason)
+            log.info("[%s] 전량 매도 결정: %s", self._label(p.code), reason, extra=NOTIFY)
         self._flush(p, now)
 
     def _flush(self, p: Position, now: datetime) -> None:
@@ -351,7 +352,7 @@ class Trader:
     def _record(self, now: datetime, code: str, side: str, qty: int, price: int, reason: str,
                 pnl: float | None = None) -> None:
         log.info("[%s] %s 체결 %s주 @ %s%s", self._label(code), side, qty, f"{price:,}",
-                 f" 손익 {pnl:+,.0f}원" if pnl is not None else "")
+                 f" 손익 {pnl:+,.0f}원" if pnl is not None else "", extra=NOTIFY)
         row = (f"{now:%H:%M:%S}", code, self.names.get(code, ""), side, qty, price, reason,
                "" if pnl is None else round(pnl))
         self.trades.append(row)

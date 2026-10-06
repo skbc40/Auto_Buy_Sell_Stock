@@ -12,11 +12,17 @@ from tkinter import messagebox, scrolledtext, simpledialog, ttk
 import yaml
 
 import main
-from trader import hm
+import tg
+from trader import NOTIFY, hm
 
 CONFIG = Path(__file__).with_name("config.yaml")
 MODE_NAMES = {"demo": "모의투자", "real": "실제투자"}
 MODE_KEYS = {v: k for k, v in MODE_NAMES.items()}
+HELP = ("명령어\n"
+        "상태 — 실행 상태·포지션·오늘 손익\n"
+        "시작 — 자동매매 시작 (실제투자 모드는 '시작 실제투자')\n"
+        "중지 — 자동매매 중지 (보유 종목이 있으면 '중지 확인')\n"
+        "도움말 — 이 안내")
 
 # (섹션, 키, 화면 이름, 형식) — 섹션 None 은 최상위 키
 FIELDS = [
@@ -83,6 +89,12 @@ class App:
         self.logq: queue.Queue = queue.Queue()
         logging.getLogger().addHandler(QueueHandler(self.logq))
         logging.getLogger().setLevel(logging.INFO)
+        self.tg = None
+        cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+        if cfg.get("telegram", {}).get("enabled") and (cred := tg.load_credentials()):
+            self.tg = tg.Telegram(*cred, on_command=self.on_telegram)
+            logging.getLogger().addHandler(tg.NotifyHandler(self.tg))
+            self.tg.send("자동매매 프로그램이 켜졌습니다. '도움말' 로 명령어 확인")
 
         top = ttk.Frame(root, padding=6)
         top.pack(fill="x")
@@ -176,11 +188,14 @@ class App:
         return True
 
     # ---- 실행 ----
-    def start(self) -> None:
-        if not self.save():
+    def start(self, confirmed: bool = False) -> None:
+        """confirmed=True 는 텔레그램에서 이미 확인을 받은 경우 (화면 설정 저장·확인창 생략)."""
+        if self.thread and self.thread.is_alive():
+            return
+        if not confirmed and not self.save():
             return
         cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-        if cfg["mode"] == "real":
+        if cfg["mode"] == "real" and not confirmed:
             answer = simpledialog.askstring(
                 "실제투자 확인", "실제투자 모드입니다. 실제 돈으로 주문합니다.\n진행하려면 '실제투자' 라고 입력하세요.", parent=self.root)
             if (answer or "").strip() != "실제투자":
@@ -198,11 +213,11 @@ class App:
                 asyncio.run(main.run(cfg, self.halt, self.state))
         except BaseException as e:  # sys.exit 포함
             logging.getLogger("gui").error("실행 중 오류: %s", e)
-        logging.getLogger("gui").info("자동매매 중지됨")
+        logging.getLogger("gui").info("자동매매 중지됨", extra=NOTIFY)
 
-    def stop(self) -> None:
+    def stop(self, confirmed: bool = False) -> None:
         tr = self.state.get("trader")
-        if tr and tr.pos and not messagebox.askyesno(
+        if tr and tr.pos and not confirmed and not messagebox.askyesno(
                 "중지 확인", "보유 중이거나 매수 대기 중인 종목이 있습니다.\n중지하면 더 이상 관리(손절·청산)하지 않습니다. 중지할까요?"):
             return
         self.halt.set()
@@ -216,6 +231,58 @@ class App:
             self.thread.join(timeout=5)
         self.root.destroy()
 
+    def status_label(self) -> str:
+        if not (self.thread and self.thread.is_alive()):
+            return "중지됨"
+        if self.state.get("trader") is None:
+            return "장 시작 대기 중"
+        return "실행 중 · 연결됨" if self.state.get("connected") else "실행 중 · 연결 중…"
+
+    # ---- 텔레그램 명령 (텔레그램 수신 스레드에서 호출됨 → 화면 조작은 root.after 로) ----
+    def on_telegram(self, text: str) -> str:
+        words = text.lstrip("/").split()
+        cmd, arg = (words[0].lower(), " ".join(words[1:])) if words else ("", "")
+        running = self.thread is not None and self.thread.is_alive()
+        if cmd in ("시작", "start"):
+            if running:
+                return "이미 실행 중입니다. " + self.status_label()
+            cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+            if cfg["mode"] == "real" and arg != "실제투자":
+                return "실제투자 모드입니다. 실제 돈으로 주문합니다.\n시작하려면 '시작 실제투자' 라고 보내세요."
+            self.root.after(0, lambda: self.start(confirmed=True))
+            return f"시작합니다 ({MODE_NAMES[cfg['mode']]})."
+        if cmd in ("중지", "stop"):
+            if not running:
+                return "실행 중이 아닙니다."
+            tr = self.state.get("trader")
+            if tr and tr.pos and arg != "확인":
+                return (f"보유·매수대기 {len(tr.pos)}종목이 있습니다. 중지하면 손절·청산 관리를 하지 않습니다.\n"
+                        "그래도 중지하려면 '중지 확인' 이라고 보내세요.")
+            self.root.after(0, lambda: self.stop(confirmed=True))
+            return "중지합니다."
+        if cmd in ("상태", "status", "r"):
+            return self.status_text()
+        return HELP
+
+    def status_text(self) -> str:
+        tr = self.state.get("trader")
+        lines = [f"상태: {self.status_label()}"]
+        if tr is None:
+            return lines[0]
+        lines.append(f"모드: {MODE_NAMES[self.state.get('mode', 'demo')]} / 구독 {self.state.get('subscribed', 0)}종목")
+        for p in list(tr.pos.values()):
+            price = tr.price.get(p.code, 0)
+            st = "매수 대기" if not p.bought else "매도 중" if p.close_reason else "보유"
+            rate = f" ({(price / p.avg - 1) * 100:+.2f}%)" if p.avg else ""
+            lines.append(f"- {tr._label(p.code)} {st} {p.qty}주 평균 {p.avg:,.0f} 현재 {price:,}{rate}")
+        if not tr.pos:
+            lines.append("보유 종목 없음")
+        pnl = sum(t[7] for t in list(tr.trades) if t[7] != "")
+        watch = [r for r in list(tr.ranks.values()) if tr.watching(r.code)]
+        lines.append(f"오늘 체결 {len(tr.trades)}건 / 실현손익 {pnl:+,}원 (수수료 제외)")
+        lines.append(f"조건 충족 {len(watch)}종목 / 진입 {len(tr.entered)}종목")
+        return "\n".join(lines)
+
     # ---- 1초마다 화면 갱신 ----
     def tick(self) -> None:
         while not self.logq.empty():
@@ -228,12 +295,7 @@ class App:
         if not running and self.btn_start["state"] == "disabled":
             self.btn_start["state"], self.btn_stop["state"] = "normal", "disabled"
         tr = self.state.get("trader")
-        if not running:
-            self.lbl_status["text"] = "중지됨"
-        elif tr is None:
-            self.lbl_status["text"] = "장 시작 대기 중"
-        else:
-            self.lbl_status["text"] = "실행 중 · 연결됨" if self.state.get("connected") else "실행 중 · 연결 중…"
+        self.lbl_status["text"] = self.status_label()
         if tr:
             mode = self.state.get("mode", "demo")
             self.lbl_status["foreground"] = "red" if mode == "real" else "black"
