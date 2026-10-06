@@ -1,9 +1,7 @@
 # 기준봉 단타 자동매매 설정 (시각은 반드시 따옴표, 퍼센트는 퍼센트 단위: 3.0 = 3%)
-# App Key / Secret 은 여기에 쓰지 않는다. kwcli(kiwoomcli setup)에 등록된 모의투자 키를 쓴다.
+# App Key / Secret 은 여기에 쓰지 않는다. kwcli(kiwoomcli setup)에 모드별로 등록된 키를 쓴다.
 
-mode: demo              # 모의투자 전용. demo 가 아니면 실행하지 않는다.
-dry_run: true           # true: 주문 없이 가상 체결로 기록만 / false: 모의투자 계좌에 실제 주문
-dry_run_cash: 10000000  # dry_run 일 때 가상 예수금(원)
+mode: demo              # demo: 모의투자 / real: 실제투자 (실제 돈으로 주문)
 
 session:
   start: "08:00"                     # 기준봉 탐색 시작 (프리장)

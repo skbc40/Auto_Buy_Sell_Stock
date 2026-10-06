@@ -7,7 +7,7 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
 import yaml
 
@@ -15,10 +15,12 @@ import main
 from trader import hm
 
 CONFIG = Path(__file__).with_name("config.yaml")
+MODE_NAMES = {"demo": "모의투자", "real": "실제투자"}
+MODE_KEYS = {v: k for k, v in MODE_NAMES.items()}
 
 # (섹션, 키, 화면 이름, 형식) — 섹션 None 은 최상위 키
 FIELDS = [
-    (None, "dry_run", "가상 체결 (주문 안 함)", bool),
+    (None, "mode", "투자 모드", "mode"),
     ("session", "start", "기준봉 탐색 시작", "time"),
     ("session", "entry_end", "신규 진입 마감", "time"),
     ("session", "force_close", "강제 청산", "time"),
@@ -121,12 +123,10 @@ class App:
         self.vars = {}
         for i, (sec, key, label, kind) in enumerate(FIELDS):
             ttk.Label(f, text=label).grid(row=i, column=0, sticky="w", pady=2)
-            if kind is bool:
-                v = tk.BooleanVar()
-                ttk.Checkbutton(f, variable=v).grid(row=i, column=1, sticky="w")
-            elif isinstance(kind, tuple):
+            if kind == "mode" or isinstance(kind, tuple):
                 v = tk.StringVar()
-                ttk.Combobox(f, textvariable=v, values=kind, state="readonly", width=12).grid(row=i, column=1, sticky="w")
+                values = list(MODE_KEYS) if kind == "mode" else kind
+                ttk.Combobox(f, textvariable=v, values=values, state="readonly", width=12).grid(row=i, column=1, sticky="w")
             else:
                 v = tk.StringVar()
                 ttk.Entry(f, textvariable=v, width=14).grid(row=i, column=1, sticky="w")
@@ -149,15 +149,16 @@ class App:
     def load(self) -> None:
         cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
         for (sec, key), v in self.vars.items():
-            v.set((cfg[sec] if sec else cfg)[key])
+            val = (cfg[sec] if sec else cfg)[key]
+            v.set(MODE_NAMES[val] if (sec, key) == (None, "mode") else val)
 
     def save(self) -> bool:
-        text = CONFIG.read_text(encoding="utf-8")
+        text = CONFIG.read_bytes().decode("utf-8")  # 줄바꿈(CRLF/LF) 그대로 유지
         try:
             for sec, key, label, kind in FIELDS:
                 raw = self.vars[(sec, key)].get()
-                if kind is bool:
-                    val = "true" if raw else "false"
+                if kind == "mode":
+                    val = MODE_KEYS[raw]
                 elif kind == "time":
                     hm(str(raw).strip())
                     val = f'"{str(raw).strip()}"'
@@ -170,7 +171,7 @@ class App:
         except (ValueError, KeyError) as e:
             messagebox.showerror("설정 오류", f"'{label}' 값이 올바르지 않습니다: {raw}\n({e})")
             return False
-        CONFIG.write_text(text, encoding="utf-8")
+        CONFIG.write_bytes(text.encode("utf-8"))
         logging.getLogger("gui").info("설정 저장됨")
         return True
 
@@ -179,9 +180,12 @@ class App:
         if not self.save():
             return
         cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-        if not cfg["dry_run"] and not messagebox.askyesno(
-                "실제 주문 확인", "가상 체결이 꺼져 있습니다.\n키움 모의투자 계좌에 실제로 주문을 냅니다. 시작할까요?"):
-            return
+        if cfg["mode"] == "real":
+            answer = simpledialog.askstring(
+                "실제투자 확인", "실제투자 모드입니다. 실제 돈으로 주문합니다.\n진행하려면 '실제투자' 라고 입력하세요.", parent=self.root)
+            if (answer or "").strip() != "실제투자":
+                messagebox.showinfo("취소", "시작하지 않았습니다.")
+                return
         self.halt.clear()
         self.state.clear()
         self.thread = threading.Thread(target=self._worker, args=(cfg,), daemon=True)
@@ -223,7 +227,7 @@ class App:
         running = self.thread is not None and self.thread.is_alive()
         if not running and self.btn_start["state"] == "disabled":
             self.btn_start["state"], self.btn_stop["state"] = "normal", "disabled"
-        tr, br = self.state.get("trader"), self.state.get("broker")
+        tr = self.state.get("trader")
         if not running:
             self.lbl_status["text"] = "중지됨"
         elif tr is None:
@@ -231,8 +235,9 @@ class App:
         else:
             self.lbl_status["text"] = "실행 중 · 연결됨" if self.state.get("connected") else "실행 중 · 연결 중…"
         if tr:
-            cash = f"{br.cash():,}원" if br.simulated else "모의계좌"
-            self.lbl_info["text"] = (f"{'가상 체결' if br.simulated else '모의투자 실제 주문'} | 예수금 {cash} | "
+            mode = self.state.get("mode", "demo")
+            self.lbl_status["foreground"] = "red" if mode == "real" else "black"
+            self.lbl_info["text"] = (f"{MODE_NAMES[mode]} | 시작 시 주문가능금액 {self.state.get('cash', 0):,}원 | "
                                      f"구독 {self.state.get('subscribed', 0)}종목 | {datetime.now():%H:%M:%S}")
             self._refresh(tr)
         self.root.after(1000, self.tick)

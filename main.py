@@ -10,11 +10,12 @@ import yaml
 from kiwoom.core.runtime import get_client, get_ws_client
 from kiwoom.realtime.packets import build_reg_packet, build_remove_packet
 
-from broker import DryBroker, KiwoomBroker, norm_code, to_float, to_int
+from broker import KiwoomBroker, norm_code, to_float, to_int
 from trader import Trader, hm
 
 WS_PATH = "/api/dostk/websocket"
 CHUNK = 50  # 실시간 등록 1회 패킷당 종목 수
+MODES = {"demo": "모의투자", "real": "실제투자"}
 log = logging.getLogger("main")
 
 
@@ -84,22 +85,22 @@ async def send_chunks(ws, codes: list[str], build) -> None:
 
 async def run(cfg: dict, halt=None, state: dict | None = None) -> None:
     """halt(threading.Event)가 설정되면 멈춘다. state 에는 GUI 가 읽을 trader/broker/연결 상태를 넣는다."""
-    if cfg.get("mode") != "demo":
-        sys.exit("config.yaml 의 mode 는 demo 만 허용합니다 (모의투자 전용 프로그램).")
+    mode = cfg.get("mode")
+    if mode not in MODES:
+        sys.exit("config.yaml 의 mode 는 demo(모의투자) 또는 real(실제투자) 이어야 합니다.")
     state = {} if state is None else state
     halted = lambda: halt is not None and halt.is_set()  # noqa: E731
     trades = setup_logging()
     u = cfg["universe"]
-    rest = KiwoomBroker(get_client(mode="demo"), cfg["api"]["rate_per_sec"], u["stex_tp"], cfg["order"]["exchange"])
-    broker = DryBroker(cfg["dry_run_cash"], rank_source=rest) if cfg["dry_run"] else rest
+    broker = KiwoomBroker(get_client(mode=mode), cfg["api"]["rate_per_sec"], u["stex_tp"], cfg["order"]["exchange"])
     trader = Trader(cfg, broker, trades)
     trader.excluded = broker.holding_codes()
-    state.update(trader=trader, broker=broker, connected=False, subscribed=0)
+    state.update(trader=trader, broker=broker, mode=mode, connected=False, subscribed=0)
     log.info("시작: %s / 예수금 %s원 / 시작 시 보유 종목(건드리지 않음): %s",
-             "가상 체결(dry_run)" if broker.simulated else "모의투자 실제 주문", f"{broker.cash():,}",
+             MODES[mode], f"{state.setdefault('cash', broker.cash()):,}",
              sorted(trader.excluded) or "없음")
 
-    ws = get_ws_client(mode="demo")
+    ws = get_ws_client(mode=mode)
     stop = hm(cfg["session"]["stop"])
     suffix = u["tick_suffix"]
     while datetime.now().time() < stop and not halted():
@@ -109,8 +110,7 @@ async def run(cfg: dict, halt=None, state: dict | None = None) -> None:
             await ws.connect(api_url=WS_PATH)
             log.info("웹소켓 연결됨")
             state["connected"] = True
-            if not broker.simulated:
-                await ws.send(build_reg_packet([""], ["00"]))  # 내 계좌 주문체결
+            await ws.send(build_reg_packet([""], ["00"]))  # 내 계좌 주문체결
             reader = asyncio.create_task(read_loop(ws, trader))
             next_rank, next_status = 0.0, 0.0
             while not reader.done() and datetime.now().time() < stop and not halted():
@@ -183,5 +183,7 @@ def wait_for_session(cfg: dict, halt=None) -> bool:
 if __name__ == "__main__":
     with open("config.yaml", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    if config.get("mode") == "real" and input("실제투자 모드입니다. 실제 돈으로 주문합니다. 진행하려면 '실제투자' 입력: ").strip() != "실제투자":
+        sys.exit("취소했습니다.")
     wait_for_session(config)
     asyncio.run(run(config))
