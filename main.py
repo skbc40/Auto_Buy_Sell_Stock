@@ -185,8 +185,6 @@ def wait_for_session(cfg: dict, halt=None) -> bool:
 if __name__ == "__main__":
     with open("config.yaml", encoding="utf-8") as f:
         config = yaml.safe_load(f)
-    if config.get("mode") == "real" and input("실제투자 모드입니다. 실제 돈으로 주문합니다. 진행하려면 '실제투자' 입력: ").strip() != "실제투자":
-        sys.exit("취소했습니다.")
     if config.get("telegram", {}).get("enabled") and (cred := tg.load_credentials()):
         logging.getLogger().addHandler(tg.NotifyHandler(tg.Telegram(*cred)))  # 알림만 (명령은 GUI 에서)
     wait_for_session(config)

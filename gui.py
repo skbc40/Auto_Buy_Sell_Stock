@@ -8,7 +8,7 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, scrolledtext, simpledialog, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 import requests
 import yaml
@@ -24,11 +24,11 @@ MODE_NAMES = {"demo": "모의투자", "real": "실제투자"}
 MODE_KEYS = {v: k for k, v in MODE_NAMES.items()}
 HELP = ("명령어\n"
         "상태 — 실행 상태·포지션·오늘 손익\n"
-        "시작 — 자동매매 시작 (실제투자 모드는 '시작 실제투자')\n"
+        "시작 — 자동매매 시작\n"
         "중지 — 자동매매 중지 (보유 종목이 있으면 '중지 확인')\n"
         "모드 — 현재 투자 모드 확인\n"
         "모드 모의 — 모의투자로 변경 (중지 상태에서)\n"
-        "모드 실제투자 확인 — 실제투자로 변경 (중지 상태에서)\n"
+        "모드 실제 — 실제투자로 변경 (중지 상태에서)\n"
         "도움말 — 이 안내")
 
 # (섹션, 키, 화면 이름, 형식) — 섹션 None 은 최상위 키
@@ -295,10 +295,7 @@ class App:
             return
         cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
         if cfg["mode"] == "real" and not confirmed:
-            answer = simpledialog.askstring(
-                "실제투자 확인", "실제투자 모드입니다. 실제 돈으로 주문합니다.\n진행하려면 '실제투자' 라고 입력하세요.", parent=self.root)
-            if (answer or "").strip() != "실제투자":
-                messagebox.showinfo("취소", "시작하지 않았습니다.")
+            if not messagebox.askyesno("실제투자 확인", "실제투자 모드입니다. 실제 돈으로 주문합니다.\n시작할까요?"):
                 return
         self.halt.clear()
         self.state.clear()
@@ -346,10 +343,9 @@ class App:
             if running:
                 return "이미 실행 중입니다. " + self.status_label()
             cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-            if cfg["mode"] == "real" and arg != "실제투자":
-                return "실제투자 모드입니다. 실제 돈으로 주문합니다.\n시작하려면 '시작 실제투자' 라고 보내세요."
             self.ui.put(lambda: self.start(confirmed=True))
-            return f"시작합니다 ({MODE_NAMES[cfg['mode']]})."
+            warn = " — 실제 돈으로 주문합니다" if cfg["mode"] == "real" else ""
+            return f"시작합니다 ({MODE_NAMES[cfg['mode']]}{warn})."
         if cmd in ("중지", "stop"):
             if not running:
                 return "실행 중이 아닙니다."
@@ -370,25 +366,21 @@ class App:
         words = arg.split()
         if not words:
             return (f"현재 투자 모드: {MODE_NAMES[current]}\n"
-                    "변경: '모드 모의' 또는 '모드 실제투자 확인' (중지 상태에서)")
+                    "변경: '모드 모의' 또는 '모드 실제' (중지 상태에서)")
         target = {"모의": "demo", "모의투자": "demo", "demo": "demo",
                   "실제": "real", "실제투자": "real", "실투자": "real", "real": "real"}.get(words[0])
         if target is None:
-            return "알 수 없는 모드입니다. '모드 모의' 또는 '모드 실제투자 확인' 이라고 보내세요."
+            return "알 수 없는 모드입니다. '모드 모의' 또는 '모드 실제' 라고 보내세요."
         if target == current:
             return f"이미 {MODE_NAMES[current]} 모드입니다."
         if running:
             return "실행 중에는 모드를 바꿀 수 없습니다. 먼저 '중지' 하세요."
-        if target == "real":
-            if default_secret_provider().get_credentials("real") is None:
-                return "실제투자 키가 등록되어 있지 않습니다. GUI 의 'API 키' 칸에서 먼저 등록하세요."
-            if words[1:] != ["확인"]:
-                return ("실제투자는 실제 돈으로 주문합니다.\n"
-                        "바꾸려면 '모드 실제투자 확인' 이라고 보내세요.")
+        if target == "real" and default_secret_provider().get_credentials("real") is None:
+            return "실제투자 키가 등록되어 있지 않습니다. GUI 의 'API 키' 칸에서 먼저 등록하세요."
         CONFIG.write_bytes(set_yaml_value(CONFIG.read_bytes().decode("utf-8"), None, "mode", target).encode("utf-8"))
         self.ui.put(lambda: self.vars[(None, "mode")].set(MODE_NAMES[target]))
         logging.getLogger("gui").info("텔레그램으로 투자 모드 변경: %s → %s", MODE_NAMES[current], MODE_NAMES[target])
-        tail = "\n시작하려면 '시작 실제투자' 라고 보내세요." if target == "real" else "\n시작하려면 '시작' 이라고 보내세요."
+        tail = "\n⚠️ 시작하면 실제 돈으로 주문합니다. 시작하려면 '시작'" if target == "real" else "\n시작하려면 '시작'"
         return f"투자 모드를 {MODE_NAMES[target]}(으)로 바꿨습니다.{tail}"
 
     def status_text(self) -> str:
@@ -422,8 +414,9 @@ class App:
             self.txt_log["state"] = "disabled"
 
         running = self.thread is not None and self.thread.is_alive()
-        if not running and self.btn_start["state"] == "disabled":
-            self.btn_start["state"], self.btn_stop["state"] = "normal", "disabled"
+        # 버튼 상태는 실행 여부로만 정한다 (ttk 위젯의 state 값은 문자열이 아니라 비교하면 안 됨)
+        self.btn_start["state"] = "disabled" if running else "normal"
+        self.btn_stop["state"] = "normal" if running and not self.halt.is_set() else "disabled"
         tr = self.state.get("trader")
         self.lbl_status["text"] = self.status_label()
         if tr:
