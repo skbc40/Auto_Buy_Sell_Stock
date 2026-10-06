@@ -3,7 +3,7 @@ import asyncio
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -145,6 +145,22 @@ async def run(cfg: dict) -> None:
              {trader._label(c): p.qty for c, p in trader.pos.items()} or "없음", f"{broker.cash():,}")
 
 
+def wait_for_session(cfg: dict) -> None:
+    """장 시간이 지났거나 주말이면 다음 평일 시작 5분 전까지 기다린다."""
+    now = datetime.now()
+    if now.weekday() < 5 and now.time() < hm(cfg["session"]["stop"]):
+        return
+    day = now.date() + timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    # ponytail: 공휴일은 모름 — 휴장일엔 틱 없이 돌다가 종료된다
+    target = datetime.combine(day, hm(cfg["session"]["start"])) - timedelta(minutes=5)
+    print(f"장 시간이 아닙니다. {target:%m/%d(%a) %H:%M} 까지 기다렸다가 시작합니다.", flush=True)
+    time.sleep((target - now).total_seconds())
+
+
 if __name__ == "__main__":
     with open("config.yaml", encoding="utf-8") as f:
-        asyncio.run(run(yaml.safe_load(f)))
+        config = yaml.safe_load(f)
+    wait_for_session(config)
+    asyncio.run(run(config))
