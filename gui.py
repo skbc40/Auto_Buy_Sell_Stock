@@ -3,13 +3,17 @@ import asyncio
 import logging
 import queue
 import re
+import socket
 import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
+import requests
 import yaml
+from kiwoom.core.runtime import get_auth
+from kiwoom.core.secrets import StaticSecretProvider, default_secret_provider
 
 import main
 import tg
@@ -87,6 +91,7 @@ class App:
         self.state: dict = {}
         self.thread: threading.Thread | None = None
         self.logq: queue.Queue = queue.Queue()
+        self.ui: queue.Queue = queue.Queue()  # 다른 스레드가 요청한 화면 작업 (tkinter 는 메인 스레드에서만)
         logging.getLogger().addHandler(QueueHandler(self.logq))
         logging.getLogger().setLevel(logging.INFO)
         self.tg = None
@@ -110,7 +115,10 @@ class App:
 
         body = ttk.Panedwindow(root, orient="horizontal")
         body.pack(fill="both", expand=True, padx=6)
-        body.add(self._settings_panel(body), weight=0)
+        left = ttk.Frame(body)
+        self._settings_panel(left).pack(fill="x")
+        self._account_panel(left).pack(fill="x", pady=(6, 0))
+        body.add(left, weight=0)
         right = ttk.Panedwindow(body, orient="vertical")
         body.add(right, weight=1)
 
@@ -146,6 +154,94 @@ class App:
         ttk.Label(f, text="※ 저장한 설정은 다음 시작부터 적용", foreground="gray").grid(
             row=len(FIELDS), column=0, columnspan=2, sticky="w", pady=(8, 0))
         return f
+
+    def _account_panel(self, parent) -> ttk.LabelFrame:
+        f = ttk.LabelFrame(parent, text="API 키 / 네트워크", padding=6)
+        self.key_mode = tk.StringVar(value="모의투자")
+        ttk.Label(f, text="키 종류").grid(row=0, column=0, sticky="w")
+        cb = ttk.Combobox(f, textvariable=self.key_mode, values=list(MODE_KEYS), state="readonly", width=12)
+        cb.grid(row=0, column=1, sticky="w")
+        cb.bind("<<ComboboxSelected>>", lambda e: self._show_key_status())
+        self.lbl_key = ttk.Label(f, text="")
+        self.lbl_key.grid(row=1, column=0, columnspan=2, sticky="w")
+        self.appkey, self.secret = tk.StringVar(), tk.StringVar()
+        for i, (label, var) in enumerate((("App Key", self.appkey), ("Secret Key", self.secret)), start=2):
+            ttk.Label(f, text=label).grid(row=i, column=0, sticky="w", pady=2)
+            ttk.Entry(f, textvariable=var, show="*", width=24).grid(row=i, column=1, sticky="w")
+        self.btn_key = ttk.Button(f, text="키 확인 후 저장", command=self.save_keys)
+        self.btn_key.grid(row=4, column=1, sticky="w", pady=(2, 8))
+
+        self.lbl_ip_local, self.lbl_ip_public = ttk.Label(f, text="-"), ttk.Label(f, text="확인 중…")
+        ttk.Label(f, text="내부 IP").grid(row=5, column=0, sticky="w")
+        self.lbl_ip_local.grid(row=5, column=1, sticky="w")
+        ttk.Label(f, text="외부(공인) IP").grid(row=6, column=0, sticky="w")
+        self.lbl_ip_public.grid(row=6, column=1, sticky="w")
+        ttk.Button(f, text="IP 새로고침", command=self.refresh_ip).grid(row=7, column=1, sticky="w", pady=2)
+        ttk.Label(f, text="※ 키움 OpenAPI 에 등록한 IP 와 외부 IP 가 같아야 접속됩니다",
+                  foreground="gray").grid(row=8, column=0, columnspan=2, sticky="w")
+        self._show_key_status()
+        self.refresh_ip()
+        return f
+
+    # ---- API 키 (Windows 자격 증명 관리자에 저장, 화면·파일에 값을 남기지 않음) ----
+    def _show_key_status(self) -> None:
+        mode = MODE_KEYS[self.key_mode.get()]
+        ok = default_secret_provider().get_credentials(mode) is not None
+        self.lbl_key["text"] = f"{self.key_mode.get()} 키: {'등록됨' if ok else '미등록'}"
+        self.lbl_key["foreground"] = "green" if ok else "red"
+
+    def save_keys(self) -> None:
+        mode, name = MODE_KEYS[self.key_mode.get()], self.key_mode.get()
+        key, secret = self.appkey.get().strip(), self.secret.get().strip()
+        if not key or not secret:
+            messagebox.showerror("입력 필요", "App Key 와 Secret Key 를 모두 입력하세요.")
+            return
+        self.btn_key["state"] = "disabled"
+        self.lbl_key["text"] = f"{name} 키 확인 중…"
+
+        def work():
+            try:  # 저장 전에 키움 서버에서 토큰이 실제로 발급되는지 확인
+                get_auth(mode, secret_provider=StaticSecretProvider(key, secret),
+                         token_store_kind="memory").refresh_access_token()
+                default_secret_provider().set_credentials(mode, key, secret)
+                get_auth(mode).clear_token()  # 이전 키로 받아 둔 토큰 폐기
+                result = (True, f"{name} 키를 저장했습니다.\n실행 중이면 다음 시작부터 적용됩니다.")
+            except Exception as e:
+                result = (False, f"키 확인에 실패해 저장하지 않았습니다.\n{e}\n\n(키 오타, 또는 키움에 등록되지 않은 IP 일 수 있습니다)")
+            self.ui.put(lambda: self._keys_done(*result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _keys_done(self, ok: bool, msg: str) -> None:
+        self.btn_key["state"] = "normal"
+        if ok:
+            self.appkey.set("")
+            self.secret.set("")
+            logging.getLogger("gui").info("%s 키 저장됨", self.key_mode.get())
+            messagebox.showinfo("저장 완료", msg)
+        else:
+            messagebox.showerror("저장 실패", msg)
+        self._show_key_status()
+
+    # ---- IP ----
+    def refresh_ip(self) -> None:
+        self.lbl_ip_public["text"] = "확인 중…"
+
+        def work():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect(("8.8.8.8", 80))  # 실제 전송 없이 나가는 인터페이스 주소만 얻는다
+                    local = s.getsockname()[0]
+            except OSError:
+                local = "확인 실패"
+            try:
+                public = requests.get("https://api.ipify.org", timeout=5).text.strip()
+            except Exception:
+                public = "확인 실패 (인터넷 연결 확인)"
+            self.ui.put(lambda: (self.lbl_ip_local.configure(text=local),
+                                        self.lbl_ip_public.configure(text=public)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _table(self, parent, title: str, cols: tuple, height: int) -> ttk.Treeview:
         f = ttk.LabelFrame(parent, text=title)
@@ -249,7 +345,7 @@ class App:
             cfg = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
             if cfg["mode"] == "real" and arg != "실제투자":
                 return "실제투자 모드입니다. 실제 돈으로 주문합니다.\n시작하려면 '시작 실제투자' 라고 보내세요."
-            self.root.after(0, lambda: self.start(confirmed=True))
+            self.ui.put(lambda: self.start(confirmed=True))
             return f"시작합니다 ({MODE_NAMES[cfg['mode']]})."
         if cmd in ("중지", "stop"):
             if not running:
@@ -258,7 +354,7 @@ class App:
             if tr and tr.pos and arg != "확인":
                 return (f"보유·매수대기 {len(tr.pos)}종목이 있습니다. 중지하면 손절·청산 관리를 하지 않습니다.\n"
                         "그래도 중지하려면 '중지 확인' 이라고 보내세요.")
-            self.root.after(0, lambda: self.stop(confirmed=True))
+            self.ui.put(lambda: self.stop(confirmed=True))
             return "중지합니다."
         if cmd in ("상태", "status", "r"):
             return self.status_text()
@@ -285,6 +381,8 @@ class App:
 
     # ---- 1초마다 화면 갱신 ----
     def tick(self) -> None:
+        while not self.ui.empty():
+            self.ui.get()()
         while not self.logq.empty():
             self.txt_log["state"] = "normal"
             self.txt_log.insert("end", self.logq.get() + "\n")
