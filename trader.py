@@ -123,6 +123,7 @@ class Trader:
         self.orders: dict[str, Order] = {}
         self.base_cash: int | None = None
         self.ticks = 0
+        self.trades: list[tuple] = []           # (시각, 코드, 종목명, 구분, 수량, 가격, 사유, 손익) — GUI 표시용
 
     # ---- 감시 대상 ----
     def update_rank(self, rows: list[RankRow]) -> set[str]:
@@ -351,6 +352,9 @@ class Trader:
                 pnl: float | None = None) -> None:
         log.info("[%s] %s 체결 %s주 @ %s%s", self._label(code), side, qty, f"{price:,}",
                  f" 손익 {pnl:+,.0f}원" if pnl is not None else "")
+        row = (f"{now:%H:%M:%S}", code, self.names.get(code, ""), side, qty, price, reason,
+               "" if pnl is None else round(pnl))
+        self.trades.append(row)
         if self.trades_path is None:
             return
         new = not self.trades_path.exists()
@@ -358,5 +362,4 @@ class Trader:
             w = csv.writer(f)
             if new:
                 w.writerow(["시각", "종목코드", "종목명", "구분", "수량", "가격", "사유", "손익(수수료 제외)"])
-            w.writerow([f"{now:%H:%M:%S}", code, self.names.get(code, ""), side, qty, price, reason,
-                        "" if pnl is None else round(pnl)])
+            w.writerow(row)

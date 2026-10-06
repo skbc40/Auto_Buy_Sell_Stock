@@ -25,7 +25,14 @@ def setup_logging() -> Path:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    for h in (logging.StreamHandler(sys.stdout), logging.FileHandler(logs / f"run_{day}.log", encoding="utf-8")):
+    for h in [h for h in root.handlers if getattr(h, "daytrader", False)]:  # 재시작 시 중복 방지
+        root.removeHandler(h)
+        h.close()
+    handlers = [logging.FileHandler(logs / f"run_{day}.log", encoding="utf-8")]
+    if sys.stdout:  # GUI(pythonw)에서는 콘솔이 없다
+        handlers.append(logging.StreamHandler(sys.stdout))
+    for h in handlers:
+        h.daytrader = True
         h.setFormatter(fmt)
         root.addHandler(h)
     logging.getLogger("kiwoom").setLevel(logging.WARNING)  # 라이브러리의 메시지별 로그는 끈다
@@ -75,15 +82,19 @@ async def send_chunks(ws, codes: list[str], build) -> None:
         await ws.send(build(codes[i:i + CHUNK], ["0B"]))
 
 
-async def run(cfg: dict) -> None:
+async def run(cfg: dict, halt=None, state: dict | None = None) -> None:
+    """halt(threading.Event)가 설정되면 멈춘다. state 에는 GUI 가 읽을 trader/broker/연결 상태를 넣는다."""
     if cfg.get("mode") != "demo":
         sys.exit("config.yaml 의 mode 는 demo 만 허용합니다 (모의투자 전용 프로그램).")
+    state = {} if state is None else state
+    halted = lambda: halt is not None and halt.is_set()  # noqa: E731
     trades = setup_logging()
     u = cfg["universe"]
     rest = KiwoomBroker(get_client(mode="demo"), cfg["api"]["rate_per_sec"], u["stex_tp"], cfg["order"]["exchange"])
     broker = DryBroker(cfg["dry_run_cash"], rank_source=rest) if cfg["dry_run"] else rest
     trader = Trader(cfg, broker, trades)
     trader.excluded = broker.holding_codes()
+    state.update(trader=trader, broker=broker, connected=False, subscribed=0)
     log.info("시작: %s / 예수금 %s원 / 시작 시 보유 종목(건드리지 않음): %s",
              "가상 체결(dry_run)" if broker.simulated else "모의투자 실제 주문", f"{broker.cash():,}",
              sorted(trader.excluded) or "없음")
@@ -91,17 +102,18 @@ async def run(cfg: dict) -> None:
     ws = get_ws_client(mode="demo")
     stop = hm(cfg["session"]["stop"])
     suffix = u["tick_suffix"]
-    while datetime.now().time() < stop:
+    while datetime.now().time() < stop and not halted():
         subscribed: set[str] = set()
         reader = None
         try:
             await ws.connect(api_url=WS_PATH)
             log.info("웹소켓 연결됨")
+            state["connected"] = True
             if not broker.simulated:
                 await ws.send(build_reg_packet([""], ["00"]))  # 내 계좌 주문체결
             reader = asyncio.create_task(read_loop(ws, trader))
             next_rank, next_status = 0.0, 0.0
-            while not reader.done() and datetime.now().time() < stop:
+            while not reader.done() and datetime.now().time() < stop and not halted():
                 now = datetime.now()
                 if time.monotonic() >= next_rank:
                     next_rank = time.monotonic() + u["rank_interval_sec"]
@@ -116,6 +128,7 @@ async def run(cfg: dict) -> None:
                     await send_chunks(ws, [c + suffix for c in remove], build_remove_packet)
                     trader.mark_unsubscribed(remove)
                     subscribed = wanted
+                    state["subscribed"] = len(subscribed)
                 trader.on_clock(now)
                 if time.monotonic() >= next_status:
                     next_status = time.monotonic() + 60
@@ -131,13 +144,14 @@ async def run(cfg: dict) -> None:
         except Exception as e:
             log.error("웹소켓 오류: %s", e)
         finally:
+            state["connected"] = False
             if reader:
                 reader.cancel()
             try:
                 await ws.close()
             except Exception:
                 pass
-        if datetime.now().time() < stop:
+        if datetime.now().time() < stop and not halted():
             log.info("3초 후 재연결")
             await asyncio.sleep(3)
     trader.on_clock(datetime.now())
@@ -145,18 +159,25 @@ async def run(cfg: dict) -> None:
              {trader._label(c): p.qty for c, p in trader.pos.items()} or "없음", f"{broker.cash():,}")
 
 
-def wait_for_session(cfg: dict) -> None:
-    """장 시간이 지났거나 주말이면 다음 평일 시작 5분 전까지 기다린다."""
+def wait_for_session(cfg: dict, halt=None) -> bool:
+    """장 시간이 지났거나 주말이면 다음 평일 시작 5분 전까지 기다린다. halt 로 중단되면 False."""
     now = datetime.now()
     if now.weekday() < 5 and now.time() < hm(cfg["session"]["stop"]):
-        return
+        return True
     day = now.date() + timedelta(days=1)
     while day.weekday() >= 5:
         day += timedelta(days=1)
     # ponytail: 공휴일은 모름 — 휴장일엔 틱 없이 돌다가 종료된다
     target = datetime.combine(day, hm(cfg["session"]["start"])) - timedelta(minutes=5)
-    print(f"장 시간이 아닙니다. {target:%m/%d(%a) %H:%M} 까지 기다렸다가 시작합니다.", flush=True)
-    time.sleep((target - now).total_seconds())
+    msg = f"장 시간이 아닙니다. {target:%m/%d(%a) %H:%M} 까지 기다렸다가 시작합니다."
+    log.info(msg)
+    if sys.stdout:
+        print(msg, flush=True)
+    wait = (target - now).total_seconds()
+    if halt is None:
+        time.sleep(wait)
+        return True
+    return not halt.wait(wait)
 
 
 if __name__ == "__main__":
