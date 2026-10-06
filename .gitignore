@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.pytest_cache/
+logs/
+.env
+*_appkey.txt
+*_secretkey.txt
