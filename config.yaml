@@ -1,7 +1,7 @@
 # 기준봉 단타 자동매매 설정 (시각은 반드시 따옴표, 퍼센트는 퍼센트 단위: 3.0 = 3%)
 # App Key / Secret 은 여기에 쓰지 않는다. kwcli(kiwoomcli setup)에 모드별로 등록된 키를 쓴다.
 
-mode: demo              # demo: 모의투자 / real: 실제투자 (실제 돈으로 주문)
+mode: real              # demo: 모의투자 / real: 실제투자 (실제 돈으로 주문)
 
 session:
   start: "08:00"                     # 기준봉 탐색 시작 (프리장)
